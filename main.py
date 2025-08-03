@@ -1,91 +1,210 @@
 import asyncio
 import csv
+import random
 from urllib.parse import urlparse
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Page, BrowserContext
 
+# --- SETTINGS ---
 USER_DATA_DIR = "./user_data"
 PROFILE_URL = "https://www.meetup.com/ru-RU/members/398792140/"
+# Number of parallel workers to scrape organizers
+MAX_WORKERS = 3
+# Random delay between actions to mimic human behavior
+MIN_DELAY_S = 1
+MAX_DELAY_S = 2
+
+# --- QUEUES ---
+groups_queue = asyncio.Queue()
+results_queue = asyncio.Queue()
 
 
-async def scrape_groups(page):
-    groups = []
+async def group_producer(page: Page):
+    """
+    Finds all group URLs on the main profile page and puts them into the groups_queue.
+    This acts as the "Producer".
+    """
+    print("Starting group producer...")
+    try:
+        await page.wait_for_selector('div[data-testid="groups-container"]', timeout=30000)
+        
+        processed_urls = set()
+
+        while True:
+            group_divs = await page.query_selector_all('div[data-testid="groups-container"] > div')
+
+            for group_div in group_divs:
+                link_el = await group_div.query_selector('a.ds-font-body-medium')
+                if not link_el:
+                    continue
+                
+                group_url = await link_el.get_attribute('href')
+                if group_url and not group_url.startswith('http'):
+                    group_url = "https://www.meetup.com" + group_url
+
+                if group_url and group_url not in processed_urls:
+                    group_name = (await link_el.inner_text()).strip()
+                    await groups_queue.put({"group_name": group_name, "group_url": group_url})
+                    processed_urls.add(group_url)
+
+            # Check for "Show more groups" button
+            show_more_buttons = await page.query_selector_all('[data-testid="show-more-groups"]')
+            if show_more_buttons:
+                show_more_btn = show_more_buttons[-1]
+                is_disabled = await show_more_btn.is_disabled()
+                if is_disabled:
+                    print("Producer: 'Show more' button is disabled. No more groups to find.")
+                    break
+                
+                try:
+                    # More robust clicking logic
+                    await show_more_btn.scroll_into_view_if_needed()
+                    await show_more_btn.wait_for_element_state('visible', timeout=5000)
+                    await show_more_btn.click(timeout=5000)
+                    # Wait for new content to load
+                    await asyncio.sleep(random.uniform(MIN_DELAY_S, MAX_DELAY_S))
+                except Exception as e:
+                    print(f"Producer: Could not click 'Show more' button. Assuming it's the end. Reason: {e}")
+                    break
+            else:
+                print("Producer: No 'Show more' button found. Assuming all groups are loaded.")
+                break
+        
+        print(f"Producer finished. Found {len(processed_urls)} groups.")
+
+    except Exception as e:
+        print(f"An error occurred in the group producer: {e}")
+    finally:
+        # Signal that the producer is done by putting None for each worker
+        for _ in range(MAX_WORKERS):
+            await groups_queue.put(None)
+
+
+async def organizer_worker(context: BrowserContext, worker_id: int):
+    """
+    Takes a group from the queue, scrapes its organizers, and puts the result into the results_queue.
+    This acts as the "Consumer/Worker".
+    """
+    print(f"[Worker {worker_id}] Starting...")
+    page = await context.new_page()
 
     while True:
-        await page.wait_for_selector('div[data-testid="groups-container"]')
-        group_divs = await page.query_selector_all('div[data-testid="groups-container"] > div')
-
-        # Сохраняем уже найденные группы, чтобы избежать дубликатов
-        existing_urls = set(g["group_url"] for g in groups)
-
-        for group_div in group_divs:
-            link_el = await group_div.query_selector('a.ds-font-body-medium')
-            if not link_el:
-                continue
-            group_name = (await link_el.inner_text()).strip()
-            group_url = await link_el.get_attribute('href')
-            if group_url and not group_url.startswith('http'):
-                group_url = "https://www.meetup.com" + group_url
-            if group_url not in existing_urls:
-                groups.append({"group_name": group_name, "group_url": group_url})
-                existing_urls.add(group_url)
-
-        # Проверяем есть ли кнопка "Show more groups"
-        show_more_buttons = await page.query_selector_all('[data-testid="show-more-groups"]')
-        if show_more_buttons:
-            show_more_btn = show_more_buttons[-1]  # last button
-            is_disabled = await show_more_btn.get_property('disabled')
-            if is_disabled and await is_disabled.json_value():
-                break
-            try:
-                await show_more_btn.click()
-                await page.wait_for_timeout(1500)  # wait for new groups to load
-            except Exception as e:
-                print(f"Error clicking show more button: {e}")
-                break
-        else:
+        group_data = await groups_queue.get()
+        if group_data is None:
+            # End of queue
+            groups_queue.task_done()
             break
 
+        group_name = group_data["group_name"]
+        group_url = group_data["group_url"]
+        print(f"[Worker {worker_id}] Processing group: {group_name}")
 
-    return groups
+        try:
+            await page.goto(group_url, timeout=60000)
+            
+            # Check for CAPTCHA or access issues
+            if "human" in (await page.title()).lower() or "robot" in (await page.title()).lower():
+                print(f"[Worker {worker_id}] CAPTCHA detected on {group_url}. Skipping for now.")
+                # Optionally, put the item back in the queue for a later retry
+                # await groups_queue.put(group_data) 
+                groups_queue.task_done()
+                continue
+
+            organizers = await scrape_organizers_from_page(page, group_url)
+            
+            if not organizers:
+                await results_queue.put({
+                    "group_name": group_name,
+                    "group_url": group_url,
+                    "organizer_name": "",
+                    "organizer_profile_url": ""
+                })
+            else:
+                for org in organizers:
+                    await results_queue.put({
+                        "group_name": group_name,
+                        "group_url": group_url,
+                        "organizer_name": org["name"],
+                        "organizer_profile_url": org["profile_url"]
+                    })
+            
+            # Random delay to be less aggressive
+            await asyncio.sleep(random.uniform(MIN_DELAY_S, MAX_DELAY_S))
+
+        except PlaywrightTimeoutError:
+            print(f"⚠️ [Worker {worker_id}] Timeout on {group_url}. Skipping.")
+        except Exception as e:
+            print(f"An error occurred in worker {worker_id} on {group_url}: {e}")
+        finally:
+            groups_queue.task_done()
+
+    await page.close()
+    print(f"[Worker {worker_id}] Finished.")
 
 
-async def scrape_organizers(page, group_url):
-    # Go to group page
-    await page.goto(group_url)
-    # Wait for the organizer photo link
+async def scrape_organizers_from_page(page: Page, group_url: str):
+    """
+    Helper function to scrape organizers from an already loaded group page.
+    """
     try:
         await page.wait_for_selector('a#organizer-photo-photo', timeout=10000)
     except PlaywrightTimeoutError:
-        print(f"⚠️ Organizer link not found on {group_url}")
+        # This is a valid case for groups with no visible organizer section
         return []
 
-    # Click on the organizer photo link to open the organizers list
     await page.click('a#organizer-photo-photo')
 
-    # Wait for the organizers list to load
     try:
         await page.wait_for_selector('ul.flex.w-full.flex-col.space-y-5', timeout=10000)
     except PlaywrightTimeoutError:
-        print(f"⚠️ Organizers list not found on {group_url}")
+        print(f"⚠️ Organizers list not found on {group_url} after click.")
         return []
 
-    # Query all <li> elements inside the organizers list
     organizers_li = await page.query_selector_all('ul.flex.w-full.flex-col.space-y-5 > li')
     organizers = []
 
     for li in organizers_li:
-        # Find anchor with organizer name and profile link
         a = await li.query_selector('a.select-none.font-medium')
         if not a:
             continue
         name = (await a.inner_text()).strip()
         profile_url = await a.get_attribute('href')
-        # Make absolute if relative
         if profile_url and not profile_url.startswith('http'):
             profile_url = "https://www.meetup.com" + profile_url
         organizers.append({"name": name, "profile_url": profile_url})
 
     return organizers
+
+
+async def results_writer(csv_filename: str):
+    """
+    Takes results from the results_queue and writes them to a CSV file.
+    """
+    print("Starting results writer...")
+    processed_count = 0
+    
+    with open(csv_filename, "w", newline="", encoding="utf-8") as f:
+        fieldnames = ["group_name", "group_url", "organizer_name", "organizer_profile_url"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        while True:
+            try:
+                # Wait for a result with a timeout
+                result = await asyncio.wait_for(results_queue.get(), timeout=30.0)
+                writer.writerow(result)
+                f.flush()  # Force write to disk
+                processed_count += 1
+                results_queue.task_done()
+            except asyncio.TimeoutError:
+                # If no results for 30s, check if work is done
+                if groups_queue.empty() and all(w.done() for w in worker_tasks):
+                    print("Writer: Timed out and all workers are done. Exiting.")
+                    break
+                else:
+                    continue # Continue waiting if workers are still active
+
+    print(f"Writer finished. Wrote {processed_count} rows to {csv_filename}.")
+
 
 async def main():
     async with async_playwright() as p:
@@ -95,55 +214,71 @@ async def main():
             channel="chrome",
             viewport={"width": 1280, "height": 800},
         )
+
+        # --- Tab Guard: Automatically close unexpected new pages ---
+        async def handle_new_page(page):
+            # This handler will be triggered for any new page created after it's registered.
+            print(f"[Tab Guard] Unexpected new page opened: {page.url}. Closing it.")
+            await asyncio.sleep(1)  # Give it a moment to settle
+            try:
+                await page.close()
+            except Exception as e:
+                print(f"[Tab Guard] Failed to close page: {e}")
+        
+        context.on("page", handle_new_page)
+        # --- End of Tab Guard ---
+
+        # Get the initial page, or create one if none exist.
         page = context.pages[0] if context.pages else await context.new_page()
+        # IMPORTANT: Remove the handler for the main page so it doesn't close itself.
+        context.remove_listener("page", handle_new_page)
+        
         await page.goto(PROFILE_URL)
 
         if "/login" in page.url:
             print("Please log in manually in the opened browser window.")
+            # Re-register the handler after successful login
+            context.on("page", handle_new_page)
             await page.wait_for_url(PROFILE_URL, timeout=300000)
             print("Login successful.")
-
-        groups = await scrape_groups(page)
 
         user_id = urlparse(PROFILE_URL).path.strip("/").split("/")[-1]
         csv_filename = f"{user_id}_groups_and_organizers.csv"
 
-        # Open CSV for writing
-        with open(csv_filename, "w", newline="", encoding="utf-8") as f:
-            fieldnames = ["group_name", "group_url", "organizer_name", "organizer_profile_url"]
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
+        # --- Start all tasks ---
+        producer_task = asyncio.create_task(group_producer(page))
+        
+        global worker_tasks
+        worker_tasks = [
+            asyncio.create_task(organizer_worker(context, i + 1))
+            for i in range(MAX_WORKERS)
+        ]
+        
+        writer_task = asyncio.create_task(results_writer(csv_filename))
 
-            for group in groups:
-                print(f"Processing group: {group['group_name']} - {group['group_url']}")
-                organizers = await scrape_organizers(page, group['group_url'])
+        # --- Wait for tasks to complete ---
+        await asyncio.gather(producer_task)
+        print("Group producer has finished. Waiting for workers to process remaining items.")
+        
+        await groups_queue.join() # Wait for all groups to be processed by workers
+        print("All groups have been processed. Waiting for writer to finish.")
+        
+        # The writer will exit by timeout once all work is done
+        await writer_task
 
-                if not organizers:
-                    # Write group with no organizers found
-                    writer.writerow({
-                        "group_name": group["group_name"],
-                        "group_url": group["group_url"],
-                        "organizer_name": "",
-                        "organizer_profile_url": ""
-                    })
-                else:
-                    for org in organizers:
-                        writer.writerow({
-                            "group_name": group["group_name"],
-                            "group_url": group["group_url"],
-                            "organizer_name": org["name"],
-                            "organizer_profile_url": org["profile_url"]
-                        })
+        print(f"Finished processing. All data saved to {csv_filename}")
+        print("Scraping complete. The browser will remain open for inspection.")
+        print("Press Ctrl+C in this terminal to close the browser and exit.")
 
-        print(f"Saved data to {csv_filename}")
-
-        print("Press Ctrl+C to exit and close browser...")
         try:
+            # This will wait indefinitely until interrupted
             await asyncio.Event().wait()
-        except KeyboardInterrupt:
-            pass
-
-        await context.close()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            print("\nExiting... Closing browser.")
+        finally:
+            await context.close()
 
 if __name__ == "__main__":
+    # This global is needed for the writer to check worker status
+    worker_tasks = []
     asyncio.run(main())
