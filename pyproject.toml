@@ -6,4 +6,6 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "playwright==1.45.0",
+    "python-dotenv==0.21.1",
+    {name = "patchright", git = "https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python.git"},
 ]
