@@ -1,10 +1,13 @@
 import asyncio
 import csv
 import random
+import os
 from urllib.parse import urlparse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Page, BrowserContext
 
 # --- SETTINGS ---
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+EXTENSION_PATH = os.path.join(SCRIPT_DIR, "uBlock0.chromium")
 USER_DATA_DIR = "./user_data"
 PROFILE_URL = "https://www.meetup.com/ru-RU/members/398792140/"
 # Number of parallel workers to scrape organizers
@@ -68,25 +71,32 @@ async def group_producer(page: Page):
 
             # 2. Execute a "quick click" and then verify the outcome.
             try:
-                current_url = page.url
-                # Click without waiting for navigation, to avoid getting stuck on ad pages.
-                await show_more_btn.click(timeout=5000, no_wait_after=True)
+                response_future = asyncio.get_running_loop().create_future()
 
-                # 3. Post-click check: Did the URL change?
-                await asyncio.sleep(0.5)  # Give a brief moment for a potential redirect to register.
-                if page.url != current_url:
-                    print(f"Producer: Page URL changed unexpectedly to {page.url}. Stopping producer.")
+                def response_handler(response):
+                    if "/gql" in response.url and response.status == 200:
+                        if not response_future.done():
+                            response_future.set_result(True)
+
+                page.on("response", response_handler)
+
+                try:
+                    await show_more_btn.click(timeout=5000)
+                    await asyncio.wait_for(response_future, timeout=15.0)
+                    print("Producer: API response for new groups received.")
+                    # Give the page a fixed time to render the new groups.
+                    await asyncio.sleep(2)
+                    print("Producer: Assumed groups are rendered after 2s delay.")
+                except asyncio.TimeoutError:
+                    print("Producer: Timed out waiting for API response or render. Assuming it's the end.")
                     break
-
-                # 4. Wait for the expected result: more groups.
-                await page.wait_for_function(
-                    f"document.querySelectorAll('div[data-testid=\"groups-container\"] > div').length > {initial_group_count}",
-                    timeout=15000
-                )
-                print("Producer: Clicked 'Show more', new groups loaded.")
-
-            except PlaywrightTimeoutError:
-                print("Producer: Timed out waiting for new groups to load after click. Assuming it's the end.")
+                except Exception as e:
+                    print(f"Producer: An unexpected error occurred during click/wait: {e}")
+                    break
+                finally:
+                    page.remove_listener("response", response_handler)
+            except Exception as e:
+                print(f"Producer: A general error occurred: {e}")
                 break
             except Exception as e:
                 print(f"Producer: An error occurred while clicking 'Show more': {e}. Assuming it's the end.")
@@ -236,6 +246,10 @@ async def main():
             headless=False,
             channel="chrome",
             viewport={"width": 1280, "height": 800},
+                args=[
+                    f"--disable-extensions-except={EXTENSION_PATH}",
+                    f"--load-extension={EXTENSION_PATH}"
+                    ],
         )
 
         # --- Tab Guard: Automatically close unexpected new pages ---
