@@ -46,27 +46,35 @@ async def group_producer(page: Page):
                     await groups_queue.put({"group_name": group_name, "group_url": group_url})
                     processed_urls.add(group_url)
 
+            # We need to get the initial count before processing, then check for more.
+            initial_group_count = len(await page.query_selector_all('div[data-testid="groups-container"] > div'))
+
             # Check for "Show more groups" button
             show_more_buttons = await page.query_selector_all('[data-testid="show-more-groups"]')
-            if show_more_buttons:
-                show_more_btn = show_more_buttons[-1]
-                is_disabled = await show_more_btn.is_disabled()
-                if is_disabled:
-                    print("Producer: 'Show more' button is disabled. No more groups to find.")
-                    break
-                
-                try:
-                    # More robust clicking logic
-                    await show_more_btn.scroll_into_view_if_needed()
-                    await show_more_btn.wait_for_element_state('visible', timeout=5000)
-                    await show_more_btn.click(timeout=5000)
-                    # Wait for new content to load
-                    await asyncio.sleep(random.uniform(MIN_DELAY_S, MAX_DELAY_S))
-                except Exception as e:
-                    print(f"Producer: Could not click 'Show more' button. Assuming it's the end. Reason: {e}")
-                    break
-            else:
-                print("Producer: No 'Show more' button found. Assuming all groups are loaded.")
+            if not show_more_buttons:
+                print("Producer: No 'Show more' button found. All groups loaded.")
+                break
+
+            show_more_btn = show_more_buttons[-1]
+            if await show_more_btn.is_disabled():
+                print("Producer: 'Show more' button is disabled. All groups loaded.")
+                break
+
+            try:
+                await show_more_btn.click(timeout=5000)
+                # Wait for the result of the click: the number of groups should increase.
+                await page.wait_for_function(
+                    f"document.querySelectorAll('div[data-testid=\"groups-container\"] > div').length > {initial_group_count}",
+                    timeout=15000
+                )
+                print(f"Producer: Clicked 'Show more', new groups loaded.")
+                # Optional small delay to appear more human
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+            except PlaywrightTimeoutError:
+                print("Producer: Timed out waiting for new groups to load. Assuming it's the end.")
+                break # This is a clean exit condition
+            except Exception as e:
+                print(f"Producer: An unexpected error occurred while clicking 'Show more': {e}")
                 break
         
         print(f"Producer finished. Found {len(processed_urls)} groups.")
