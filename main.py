@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import time
 import random
 import os
 from urllib.parse import urlparse
@@ -21,36 +22,18 @@ groups_queue = asyncio.Queue()
 results_queue = asyncio.Queue()
 
 
+
 async def group_producer(page: Page):
-    """
-    Finds all group URLs on the main profile page and puts them into the groups_queue.
-    This acts as the "Producer".
-    """
     print("Starting group producer...")
     try:
         await page.wait_for_selector('div[data-testid="groups-container"]', timeout=30000)
-        
+
         processed_urls = set()
+        max_retries = 3
 
         while True:
             group_divs = await page.query_selector_all('div[data-testid="groups-container"] > div')
-
-            for group_div in group_divs:
-                link_el = await group_div.query_selector('a.ds-font-body-medium')
-                if not link_el:
-                    continue
-                
-                group_url = await link_el.get_attribute('href')
-                if group_url and not group_url.startswith('http'):
-                    group_url = "https://www.meetup.com" + group_url
-
-                if group_url and group_url not in processed_urls:
-                    group_name = (await link_el.inner_text()).strip()
-                    await groups_queue.put({"group_name": group_name, "group_url": group_url})
-                    processed_urls.add(group_url)
-
-            # --- Advanced Click & Verification Logic ---
-            initial_group_count = len(await page.query_selector_all('div[data-testid="groups-container"] > div'))
+            initial_count = len(group_divs)
 
             show_more_buttons = await page.query_selector_all('[data-testid="show-more-groups"]')
             if not show_more_buttons:
@@ -62,54 +45,86 @@ async def group_producer(page: Page):
                 print("Producer: 'Show more' button is disabled. All groups loaded.")
                 break
 
-            # 1. Pre-click check: Is the button inside an iframe (a common ad technique)?
             is_in_iframe = await show_more_btn.evaluate("node => !!node.closest('iframe')")
             if is_in_iframe:
-                print("Producer: 'Show more' button is inside an iframe, likely an ad. Skipping click and waiting.")
-                await asyncio.sleep(5)  # Wait for the ad to hopefully disappear
+                print("Producer: Button in iframe, waiting 5 seconds...")
+                await asyncio.sleep(5)
                 continue
 
-            # 2. Execute a "quick click" and then verify the outcome.
+            # Ждем кликабельность кнопки
             try:
-                response_future = asyncio.get_running_loop().create_future()
+                await show_more_btn.wait_for_element_state("visible", timeout=5000)
+                await show_more_btn.wait_for_element_state("enabled", timeout=5000)
+            except Exception:
+                print("Producer: Show more button not clickable, retrying...")
+                await asyncio.sleep(2)
+                continue
 
-                def response_handler(response):
-                    if "/gql" in response.url and response.status == 200:
-                        if not response_future.done():
-                            response_future.set_result(True)
-
-                page.on("response", response_handler)
-
+            # Пытаемся кликать с повтором, если не появляются новые группы
+            for attempt in range(max_retries):
                 try:
-                    await show_more_btn.click(timeout=5000)
-                    await asyncio.wait_for(response_future, timeout=15.0)
-                    print("Producer: API response for new groups received.")
-                    # Give the page a fixed time to render the new groups.
-                    await asyncio.sleep(2)
-                    print("Producer: Assumed groups are rendered after 2s delay.")
-                except asyncio.TimeoutError:
-                    print("Producer: Timed out waiting for API response or render. Assuming it's the end.")
-                    break
+                    print(f"Producer: Clicking 'Show more', attempt {attempt + 1}")
+                    t1 = time.monotonic()
+                    await show_more_btn.click()
+
+                    # Адаптивное ожидание новых групп
+                    new_groups_loaded = False
+                    max_wait_sec = 10
+                    interval = 0.3
+                    elapsed = 0
+
+                    while elapsed < max_wait_sec:
+                        await asyncio.sleep(interval)
+                        elapsed += interval
+
+                        current_divs = await page.query_selector_all('div[data-testid="groups-container"] > div')
+                        new_count = len(current_divs)
+                        if new_count > initial_count:
+                            t2 = time.monotonic()
+                            print(f"Producer: New groups loaded in {t2 - t1:.2f} seconds ({new_count} > {initial_count})")
+                            new_groups_loaded = True
+
+                            new_divs = current_divs[initial_count:]
+                            for group_div in new_divs:
+                                link_el = await group_div.query_selector('a.ds-font-body-medium')
+                                if not link_el:
+                                    continue
+
+                                group_url = await link_el.get_attribute('href')
+                                if group_url and not group_url.startswith('http'):
+                                    group_url = "https://www.meetup.com" + group_url
+
+                                if group_url and group_url not in processed_urls:
+                                    group_name = (await link_el.inner_text()).strip()
+                                    await groups_queue.put({"group_name": group_name, "group_url": group_url})
+                                    processed_urls.add(group_url)
+                            break
+
+                    if new_groups_loaded:
+                        break
+                    else:
+                        print("Producer: No new groups loaded after click.")
+                        if attempt < max_retries - 1:
+                            print("Producer: Retrying click...")
+                        else:
+                            print("Producer: Max retries reached, assuming end.")
+                            return
+
                 except Exception as e:
-                    print(f"Producer: An unexpected error occurred during click/wait: {e}")
-                    break
-                finally:
-                    page.remove_listener("response", response_handler)
-            except Exception as e:
-                print(f"Producer: A general error occurred: {e}")
-                break
-            except Exception as e:
-                print(f"Producer: An error occurred while clicking 'Show more': {e}. Assuming it's the end.")
-                break
-        
+                    print(f"Producer: Exception during click attempt: {e}")
+                    if attempt == max_retries - 1:
+                        print("Producer: Max retries reached due to exception, exiting.")
+                        return
+                    await asyncio.sleep(2)
+
         print(f"Producer finished. Found {len(processed_urls)} groups.")
 
     except Exception as e:
-        print(f"An error occurred in the group producer: {e}")
+        print(f"Producer error: {e}")
     finally:
-        # Signal that the producer is done by putting None for each worker
         for _ in range(MAX_WORKERS):
             await groups_queue.put(None)
+
 
 
 async def organizer_worker(context: BrowserContext, worker_id: int):
