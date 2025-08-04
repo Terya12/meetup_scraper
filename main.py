@@ -4,7 +4,11 @@ import time
 import random
 import os
 from urllib.parse import urlparse
+
+
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Page, BrowserContext
+
+
 
 # --- SETTINGS ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -14,8 +18,8 @@ PROFILE_URL = "https://www.meetup.com/ru-RU/members/398792140/"
 # Number of parallel workers to scrape organizers
 MAX_WORKERS = 3
 # Random delay between actions to mimic human behavior
-MIN_DELAY_S = 1
-MAX_DELAY_S = 2
+MIN_DELAY_S = 0.5
+MAX_DELAY_S = 1
 
 # --- QUEUES ---
 groups_queue = asyncio.Queue()
